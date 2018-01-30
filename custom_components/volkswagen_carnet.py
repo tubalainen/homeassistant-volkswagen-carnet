@@ -1,25 +1,23 @@
+# -*- coding: utf-8 -*-
 import re
 import requests
-import json
 import time
 import logging
-
-from datetime import timedelta, datetime
 
 
 import voluptuous as vol
 import homeassistant.helpers.config_validation as cv
 
-
-from urllib.parse import urlsplit,urlsplit
+from datetime import timedelta, datetime
+from urllib.parse import urlsplit
 from urllib.error import HTTPError
-
 from homeassistant.const import (CONF_USERNAME, CONF_PASSWORD)
-from homeassistant.util import Throttle
 from homeassistant.helpers import discovery
 from homeassistant.helpers.event import track_point_in_utc_time
 from homeassistant.util.dt import utcnow
-from homeassistant.helpers.dispatcher import dispatcher_send
+from homeassistant.helpers.entity import Entity
+from homeassistant.helpers.icon import icon_for_battery_level
+
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -28,9 +26,8 @@ CARNET_DATA = "volkswagen_carnet"
 REQUIREMENTS = ['requests']
 CONF_UPDATE_INTERVAL = 'update_interval'
 
-MIN_UPDATE_INTERVAL = timedelta(minutes=1)
-DEFAULT_UPDATE_INTERVAL = timedelta(minutes=1)
-SIGNAL_VEHICLE_SEEN = '{}.vehicle_seen'.format(DOMAIN)
+MIN_UPDATE_INTERVAL = timedelta(minutes=2)
+DEFAULT_UPDATE_INTERVAL = timedelta(minutes=3)
 
 CONFIG_SCHEMA = vol.Schema({
     DOMAIN: vol.Schema({
@@ -54,30 +51,41 @@ def setup(hass, config):
     hass.data[CARNET_DATA] = VWCarnet(hass, username, password)
     vw = hass.data[CARNET_DATA]
 
-    # Login to online services
-    if not vw.carnet_logged_in:
-        _LOGGER.error("Failed to login to Volkswagen Carnet")
-        return False
+    def update_vehicle(login_session, vehicle):
+        """Update vehicle status from Volkswagen Carnet"""
+        if not vw._carnet_update_vehicle_status(login_session, vehicle):
+            _LOGGER.warning("Could not update vehicle %s" % (vehicle))
+            return False
+        else:
+            return True
 
-    for component in ['switch', 'device_tracker', 'sensor']:
-        discovery.load_platform(hass, component, DOMAIN, {}, config)
+    def fetch_vehicles(login_session):
+        """Fetch vehicles from Volkswagen Carnet"""
+        vw._carnet_get_vehicles(login_session)
 
-    def update_vehicle(vehicle):
-        """Revieve updated information on vehicle."""
-
-        dispatcher_send(hass, SIGNAL_VEHICLE_SEEN, vehicle)
+        if vw.vehicles:
+            for component in ['switch', 'device_tracker', 'sensor', 'binary_sensor']:
+                discovery.load_platform(hass, component, DOMAIN, vw.vehicles, config)
 
     def update(now):
-        """Update status from the online service."""
+        """Update status from Volkswagen Carnet"""
         try:
-            for vehicle in vw.vehicles:
-                if not vw._carnet_update_vehicle_status(vehicle, force_update=True):
-                    _LOGGER.warning("Could not update vehicle %s" % (vehicle))
-                    return False
+            login_session = vw._carnet_get_login_session()
+            if not login_session:
+                _LOGGER.error("Failed to login to Volkswagen Carnet")
+                return False
 
-                update_vehicle(vehicle)
+            if not vw.vehicles:
+                fetch_vehicles(login_session)
+            else:
+                for vehicle in vw.vehicles:
+                    if not update_vehicle(login_session, vehicle):
+                        return False
 
+            vw._carnet_logout_session(login_session)
+            del(login_session)
             return True
+
         finally:
             track_point_in_utc_time(hass, update, utcnow() + interval)
 
@@ -90,22 +98,12 @@ class VWCarnet(object):
         self.carnet_username = username
         self.carnet_password = password
         self.carnet_logged_in = False
+        self.update_timeout_counter = 60
         self.vehicles = {}
-
-        # Fake the VW CarNet mobile app headers
-        self.headers = { 'Accept': 'application/json, text/plain, */*', 'Content-Type': 'application/json;charset=UTF-8', 'User-Agent': 'Mozilla/5.0 (Linux; Android 6.0.1; D5803 Build/23.5.A.1.291; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/63.0.3239.111 Mobile Safari/537.36' }
-        self.base = "https://www.volkswagen-car-net.com"
-        self.session = requests.Session()
-        self.update_timeout_counter = 80 # seconds
-
-        # login to carnet
-        self._carnet_login()
-
-        # fetch vehicles
-        self._carnet_get_vehicles()
 
     def _vehicle_template(self, vin):
         vehicle_template = {
+            'initialized': False,
             'vin': vin.get('vin'),
             'pin': vin.get('enrollmentPin'),
             'name': vin.get('vehicleName'),
@@ -115,6 +113,7 @@ class VWCarnet(object):
             'dashboard_url': False,
             'profile_id': False,
             'last_connected': False,
+            'last_updated': False,
             'state_charge': False,
             'state_climat': False,
             'state_melt': False,
@@ -128,18 +127,26 @@ class VWCarnet(object):
             'sensor_electric_range_left': False,
             'sensor_next_service_inspection': False,
             'sensor_distance': False,
+            'sensor_door_locked': False,
+            'sensor_parking_lights': False,
+            'sensor_climat_without_hw_power': False,
+            'sensor_climat_time_left': False,
         }
         return vehicle_template
 
-    def _carnet_login(self):
+
+    def _carnet_get_login_session(self):
+        login_session = {
+            'session': requests.Session(),
+            'base': 'https://www.volkswagen-car-net.com',
+            'headers': { 'Accept': 'application/json, text/plain, */*', 'Content-Type': 'application/json;charset=UTF-8', 'User-Agent': 'Mozilla/5.0 (Linux; Android 6.0.1; D5803 Build/23.5.A.1.291; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/63.0.3239.111 Mobile Safari/537.36' },
+            'auth_base': 'https://security.volkswagen.com',
+            'auth_headers': {'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8', 'User-Agent': 'Mozilla/5.0 (Linux; Android 6.0.1; D5803 Build/23.5.A.1.291; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/63.0.3239.111 Mobile Safari/537.36'},
+            'url': False
+        }
         # login to carnet
         try:
-            _LOGGER.debug("Trying to login to Volkswagen Carnet")
-            AUTHHEADERS = {
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-                'User-Agent': 'Mozilla/5.0 (Linux; Android 6.0.1; D5803 Build/23.5.A.1.291; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/63.0.3239.111 Mobile Safari/537.36'}
-
-            auth_base = "https://security.volkswagen.com"
+            _LOGGER.debug("Trying to create login session")
 
             # Regular expressions to extract data
             csrf_re = re.compile('<meta name="_csrf" content="([^"]*)"/>')
@@ -164,36 +171,36 @@ class VWCarnet(object):
                 return authstate_re.search(r).group(1)
 
             # Request landing page and get CSFR:
-            r = self.session.get(self.base + '/portal/en_GB/web/guest/home')
+            r = login_session['session'].get(login_session['base'] + '/portal/en_GB/web/guest/home')
             if r.status_code != 200:
                 return ""
             csrf = extract_csrf(r)
 
             # Request login page and get CSRF
-            AUTHHEADERS["Referer"] = self.base + '/portal'
-            AUTHHEADERS["X-CSRF-Token"] = csrf
-            r = self.session.post(self.base + '/portal/web/guest/home/-/csrftokenhandling/get-login-url', headers=AUTHHEADERS)
+            login_session['auth_headers']['Referer'] = login_session['base'] + '/portal'
+            login_session['auth_headers']["X-CSRF-Token"] = csrf
+            r = login_session['session'].post(login_session['base'] + '/portal/web/guest/home/-/csrftokenhandling/get-login-url', headers = login_session['auth_headers'])
             if r.status_code != 200:
                 return ""
-            responseData = json.loads(r.content)
+            responseData = r.json()
             lg_url = responseData.get("loginURL").get("path")
 
             # no redirect so we can get values we look for
-            r = self.session.get(lg_url, allow_redirects=False, headers = AUTHHEADERS)
+            r = login_session['session'].get(lg_url, allow_redirects = False, headers = login_session['auth_headers'])
             if r.status_code != 302:
                 return ""
             ref_url = r.headers.get("location")
 
             # now get actual login page and get session id and ViewState
-            r = self.session.get(ref_url, headers = AUTHHEADERS)
+            r = login_session['session'].get(ref_url, headers = login_session['auth_headers'])
             if r.status_code != 200:
                 return ""
             view_state = extract_view_state(r)
 
             # Login with user details
-            AUTHHEADERS["Faces-Request"] = "partial/ajax"
-            AUTHHEADERS["Referer"] = ref_url
-            AUTHHEADERS["X-CSRF-Token"] = ''
+            login_session['auth_headers']["Faces-Request"] = "partial/ajax"
+            login_session['auth_headers']["Referer"] = ref_url
+            login_session['auth_headers']["X-CSRF-Token"] = ''
 
             post_data = {
                 'loginForm': 'loginForm',
@@ -209,13 +216,13 @@ class VWCarnet(object):
                 'javax.faces.partial.ajax': 'true'
             }
 
-            r = self.session.post(auth_base + '/ap-login/jsf/login.jsf', data=post_data, headers = AUTHHEADERS)
+            r = login_session['session'].post(login_session['auth_base'] + '/ap-login/jsf/login.jsf', data=post_data, headers = login_session['auth_headers'])
             if r.status_code != 200:
                 return ""
             ref_url = extract_redirect_url(r).replace('&amp;', '&')
 
             # redirect to link from login and extract state and code values
-            r = self.session.get(ref_url, allow_redirects=False, headers = AUTHHEADERS)
+            r = login_session['session'].get(ref_url, allow_redirects=False, headers = login_session['auth_headers'])
             if r.status_code != 302:
                 return ""
             ref_url2 = r.headers.get("location")
@@ -224,156 +231,132 @@ class VWCarnet(object):
             state = extract_state(ref_url2)
 
             # load ref page
-            r = self.session.get(ref_url2, headers = AUTHHEADERS)
+            r = login_session['session'].get(ref_url2, headers = login_session['auth_headers'])
             if r.status_code != 200:
                 return ""
 
-            AUTHHEADERS["Faces-Request"] = ""
-            AUTHHEADERS["Referer"] = ref_url2
+            login_session['auth_headers']["Faces-Request"] = ""
+            login_session['auth_headers']["Referer"] = ref_url2
             post_data = {
                 '_33_WAR_cored5portlet_code': code,
                 '_33_WAR_cored5portlet_landingPageUrl': ''
             }
-            r = self.session.post(self.base + urlsplit(
-                ref_url2).path + '?p_auth=' + state + '&p_p_id=33_WAR_cored5portlet&p_p_lifecycle=1&p_p_state=normal&p_p_mode=view&p_p_col_id=column-1&p_p_col_count=1&_33_WAR_cored5portlet_javax.portlet.action=getLoginStatus',
-                       data=post_data, allow_redirects=False, headers=AUTHHEADERS)
+            r = login_session['session'].post(login_session['base'] + urlsplit(ref_url2).path + '?p_auth=' + state + '&p_p_id=33_WAR_cored5portlet&p_p_lifecycle=1&p_p_state=normal&p_p_mode=view&p_p_col_id=column-1&p_p_col_count=1&_33_WAR_cored5portlet_javax.portlet.action=getLoginStatus', data = post_data, allow_redirects = False, headers = login_session['auth_headers'])
             if r.status_code != 302:
                 return ""
 
             ref_url3 = r.headers.get("location")
-            r = self.session.get(ref_url3, headers=AUTHHEADERS)
+            r = login_session['session'].get(ref_url3, headers=login_session['auth_headers'])
 
             # We have a new CSRF
             csrf = extract_csrf(r)
 
             # Update headers for requests
-            self.headers["Referer"] = ref_url3
-            self.headers["X-CSRF-Token"] = csrf
-            self.url = ref_url3
-            self.carnet_logged_in = True
-            _LOGGER.debug("Login to Volkswagen Carnet was successfull")
-            return True
+            login_session['headers']["Referer"] = ref_url3
+            login_session['headers']["X-CSRF-Token"] = csrf
+            login_session['url'] = ref_url3
+            _LOGGER.debug("Login session created")
+            return login_session
 
         except HTTPError as e:
-            _LOGGER.error("Unable to login to Volkswagen CarNet")
+            _LOGGER.error("Unable to create login session")
             _LOGGER.debug("Error msg: %s" % (e))
             return False
 
-    def _carnet_get_owners_verification(self):
-        if not self.carnet_logged_in:
-            self._carnet_login()
-        if not self.carnet_logged_in:
-            _LOGGER.error('Couldnt do action. There was a problem with the login.')
-            return False
-        url = self.base + '/portal/group/se/edit-profile/-/profile/get-vehicles-owners-verification'
-        req = self.session.post(url, headers = self.headers)
-        return json.loads(req.content)
+    def _carnet_logout_session(self, session):
+        self._carnet_post_session(session, '/-/logout/revoke')
+        self.session = None
+        _LOGGER.debug("Logout from session")
 
+    def _carnet_post_session(self, session, command):
+        req = session['session'].post(session['url'] + command, headers = session['headers'])
+        return req.json()
+        #return req.content
 
-    def _carnet_post(self, command):
-        if not self.carnet_logged_in:
-            self._carnet_login()
-        if not self.carnet_logged_in:
-            _LOGGER.error('Couldnt do action. There was a problem with the login.')
-            return False
-        req = self.session.post(self.url + command, headers = self.headers)
-        return req.content
+    def _carnet_post_action_session(self, session, command, data):
+        req = session['session'].post(session['url'] + command, json = data, headers = session['headers'])
+        return req.json()
+        #return req.content
 
-    def _carnet_post_action(self, command, data):
-        if not self.carnet_logged_in:
-            self._carnet_login()
-        if not self.carnet_logged_in:
-            _LOGGER.error('Couldnt do action. There was a problem with the login.')
-            return False
-        req = self.session.post(self.url + command, json = data, headers = self.headers)
-        return req.content
+    def _carnet_get_owners_verification(self, session):
+        url = session['base'] + '/portal/group/se/edit-profile/-/profile/get-vehicles-owners-verification'
+        req = session['session'].post(url, headers = session['headers'])
+        return req.json()
 
-    def _carnet_post_vehicle(self, vehicle, command):
-        if not self.carnet_logged_in:
-            self._carnet_login()
-        if not self.carnet_logged_in:
-            _LOGGER.error('Couldnt do action. There was a problem with the login.')
-            return False
-        dashboard_url = self.vehicles[vehicle].get('dashboard_url')
-        req = self.session.post(self.base + dashboard_url + command, headers=self.headers)
-        return req.content
+    def _carnet_post_vehicle(self, session, vehicle, command):
+        req = session['session'].post(session['base'] + self.vehicles[vehicle].get('dashboard_url') + command, headers = session['headers'])
+        return req.json()
 
     def _carnet_post_action_vehicle(self, vehicle, command, data):
-        if not self.carnet_logged_in:
-            self._carnet_login()
-        if not self.carnet_logged_in:
-            _LOGGER.error('Couldnt do action. There was a problem with the login.')
+        # create login session for each action
+        login_session = self._carnet_get_login_session()
+        if not login_session:
+            _LOGGER.error('Could not create login session.')
             return False
-        dashboard_url = self.vehicles[vehicle].get('dashboard_url')
-        req = self.session.post(self.base + dashboard_url + command, json=data, headers=self.headers)
-        return req.content
+        req = login_session['session'].post(login_session['base'] + self.vehicles[vehicle].get('dashboard_url') + command, json=data, headers = login_session['headers'])
+        self._carnet_logout_session(login_session)
+        del(login_session)
+        return req.json()
 
     def _carnet_start_charge(self, vehicle):
-        _LOGGER.debug("Trying to start charging")
         self._set_state('charge', vehicle, True)
         post_data = {
             'triggerAction': True,
             'batteryPercent': '100'
         }
-        return json.loads(self._carnet_post_action_vehicle(vehicle, '/-/emanager/charge-battery', post_data))
+        return self._carnet_post_action_vehicle(vehicle, '/-/emanager/charge-battery', post_data)
 
     def _carnet_stop_charge(self, vehicle):
-        _LOGGER.debug("Trying to stop charging")
         self._set_state('charge', vehicle, False)
         post_data = {
             'triggerAction': False,
             'batteryPercent': '99'
         }
-        return json.loads(self._carnet_post_action_vehicle(vehicle, '/-/emanager/charge-battery', post_data))
+        return self._carnet_post_action_vehicle(vehicle, '/-/emanager/charge-battery', post_data)
 
 
     def _carnet_start_climat(self, vehicle):
-        _LOGGER.debug("Trying to start climat")
         self._set_state('climat', vehicle, True)
         post_data = {
             'triggerAction': True,
             'electricClima': True
         }
-        return json.loads(self._carnet_post_action_vehicle(vehicle, '/-/emanager/trigger-climatisation', post_data))
+        return self._carnet_post_action_vehicle(vehicle, '/-/emanager/trigger-climatisation', post_data)
 
 
     def _carnet_stop_climat(self, vehicle):
-        _LOGGER.debug("Trying to stop climat")
         self._set_state('climat', vehicle, False)
         post_data = {
             'triggerAction': False,
             'electricClima': True
         }
-        return json.loads(self._carnet_post_action_vehicle(vehicle, '/-/emanager/trigger-climatisation', post_data))
+        return self._carnet_post_action_vehicle(vehicle, '/-/emanager/trigger-climatisation', post_data)
 
     def _carnet_start_window_melt(self, vehicle):
-        _LOGGER.debug("Trying to start window melt")
         self._set_state('melt', vehicle, True)
         post_data = {
             'triggerAction': True
         }
-        return json.loads(self._carnet_post_action_vehicle(vehicle, '/-/emanager/trigger-windowheating', post_data))
+        return self._carnet_post_action_vehicle(vehicle, '/-/emanager/trigger-windowheating', post_data)
 
     def _carnet_stop_window_melt(self, vehicle):
-        _LOGGER.debug("Trying to stop window melt")
         self._set_state('melt', vehicle, False)
         post_data = {
             'triggerAction': False
         }
-        return json.loads(self._carnet_post_action_vehicle(vehicle, '/-/emanager/trigger-windowheating', post_data))
+        return self._carnet_post_action_vehicle(vehicle, '/-/emanager/trigger-windowheating', post_data)
 
-    @Throttle(timedelta(seconds=1))
-    def _carnet_get_vehicles(self):
+    def _carnet_get_vehicles(self, session):
         _LOGGER.debug('Fetching vehicles from Volkswagen Carnet')
         # get vehicles
         try:
-            data_owner_verification = self._carnet_get_owners_verification()
+            data_owner_verification = self._carnet_get_owners_verification(session)
             for vehicle in data_owner_verification['vehiclesForEnrollmentResponseList']:
                 self.vehicles[vehicle.get('vin')] = self._vehicle_template(vehicle)
                 _LOGGER.debug('Adding vehicle: %s' % (vehicle.get('vin')))
 
             # add extra information
-            non_loaded_cars = json.loads(self._carnet_post('/-/mainnavigation/get-fully-loaded-cars'))
+            non_loaded_cars = self._carnet_post_session(session, '/-/mainnavigation/get-fully-loaded-cars')
             for vehicle in non_loaded_cars['fullyLoadedVehiclesResponse']['completeVehicles']:
                 if vehicle.get('vin') in self.vehicles:
                     self.vehicles[vehicle.get('vin')]['dashboard_url'] = vehicle.get('dashboardUrl')
@@ -399,29 +382,49 @@ class VWCarnet(object):
             self.carnet_logged_in = False
             return False
 
-    @Throttle(timedelta(seconds=1))
-    def _carnet_update_vehicle_status(self, vehicle, force_update = False):
+        # fetch vehicle status
+        for vehicle in self.vehicles:
+            self._carnet_update_vehicle_status(session, vehicle)
+
+    def _carnet_update_vehicle_status(self, session, vehicle):
         _LOGGER.debug("Trying to update status for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
         try:
             # request car update
-            self._carnet_post_vehicle(vehicle, '/-/vsr/request-vsr')
+            self._carnet_post_vehicle(session, vehicle, '/-/vsr/request-vsr')
 
-            request_status = json.loads(self._carnet_post_vehicle(vehicle, '/-/vsr/get-vsr'))
-            # wait for update to be completed:
-            #timeout_counter = 0
-            #if force_update:
-            #    while request_status['vehicleStatusData']['requestStatus'] == 'REQUEST_IN_PROGRESS':
-            #        request_status = json.loads(self._carnet_post_vehicle(vehicle, '/-/vsr/get-vsr'))
-            #        timeout_counter += 1
-            #        time.sleep(1)
-            #        if timeout_counter > self.update_timeout_counter:
-            #            raise HTTPError(code = '408', msg = 'Request to Volkswagen Carnet timeout.', hdrs = '', fp = None, url = None)
+
+            if self.vehicles[vehicle].get('initialized'):
+                # wait for update to be completed:
+                timeout_counter = 0
+                msg_waiting_request = False
+                while True:
+                    timeout_counter += 1
+                    time.sleep(1)
+
+                    if timeout_counter > self.update_timeout_counter:
+                        _LOGGER.debug("Failed to fetch latest status from vehicle %s, request timed out." % (self.vehicles[vehicle].get('vin')))
+                        break
+
+                    request_status = self._carnet_post_vehicle(session,vehicle, '/-/vsr/get-vsr')['vehicleStatusData']['requestStatus']
+                    if request_status == 'REQUEST_IN_PROGRESS':
+                        if not msg_waiting_request:
+                            _LOGGER.debug("Waiting for update request from vehicle %s" % (self.vehicles[vehicle].get('vin')))
+                            msg_waiting_request = True
+                        continue
+                    elif request_status == 'ERROR':
+                        _LOGGER.debug("Failed to fetch latest status from vehicle %s" % (self.vehicles[vehicle].get('vin')))
+                        break
+                    else:
+                        continue
+            else:
+                self.vehicles[vehicle]['initialized'] = True
 
             # get data from carnet
-            data_emanager = json.loads(self._carnet_post_vehicle(vehicle, '/-/emanager/get-emanager'))
-            data_location = json.loads(self._carnet_post_vehicle(vehicle, '/-/cf/get-location'))
-            data_details = json.loads(self._carnet_post_vehicle(vehicle,'/-/vehicle-info/get-vehicle-details'))
+            data_emanager = self._carnet_post_vehicle(session, vehicle, '/-/emanager/get-emanager')
+            data_location = self._carnet_post_vehicle(session, vehicle, '/-/cf/get-location')
+            data_details = self._carnet_post_vehicle(session, vehicle,'/-/vehicle-info/get-vehicle-details')
+            data_car = self._carnet_post_vehicle(session, vehicle, '/-/vsr/get-vsr')
             _LOGGER.debug("Status updated for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
         except HTTPError as e:
@@ -430,74 +433,126 @@ class VWCarnet(object):
             self.carnet_logged_in = False
             return False
 
+        # set new last updated
+        self.vehicles[vehicle]['last_updated'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # set new location data
         try:
             self.vehicles[vehicle]['location_latitude'] = data_location['position']['lat']
             self.vehicles[vehicle]['location_longitude'] = data_location['position']['lng']
         except:
-            _LOGGER.error("Failed to set location status for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+            _LOGGER.debug("Failed to set location status for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
         # set powersupply sensor
         try:
             if data_emanager['EManager']['rbc']['status']['extPowerSupplyState'] == 'UNAVAILABLE':
-                self.vehicles[vehicle]['sensor_external_power_connected'] = 'no'
+                self.vehicles[vehicle]['sensor_external_power_connected'] = False
             else:
-                self.vehicles[vehicle]['sensor_external_power_connected'] = 'yes'
+                self.vehicles[vehicle]['sensor_external_power_connected'] = True
         except:
-            _LOGGER.error("Failed to set powersupply status for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+            self.vehicles[vehicle]['sensor_external_power_connected'] = False
+            _LOGGER.debug("Failed to set powersupply status for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
         # set battery sensor
         try:
             self.vehicles[vehicle]['sensor_battery_left'] = int(data_emanager['EManager']['rbc']['status']['batteryPercentage'])
         except:
-            _LOGGER.error("Failed to set battery sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+            self.vehicles[vehicle]['sensor_battery_left'] = False
+            _LOGGER.debug("Failed to set battery sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
         # set charger max ampere sensor
         try:
             self.vehicles[vehicle]['sensor_charge_max_ampere'] = int(data_emanager['EManager']['rbc']['settings']['chargerMaxCurrent'])
         except:
-            _LOGGER.error("Failed to set charger max ampere sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+            _LOGGER.debug("Failed to set charger max ampere sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
         # set target temperatrue sensor
         try:
             self.vehicles[vehicle]['sensor_climat_target_temperature'] = int(data_emanager['EManager']['rpc']['settings']['targetTemperature'])
         except:
-            _LOGGER.error("Failed to set target temperature sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+            _LOGGER.debug("Failed to set target temperature sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+
+        # set climat without external power sensor
+        try:
+            if data_emanager['EManager']['rpc']['settings']['climatisationWithoutHVPower']:
+                self.vehicles[vehicle]['sensor_climat_without_hw_power'] = True
+            else:
+                self.vehicles[vehicle]['sensor_climat_without_hw_power'] = False
+        except:
+            _LOGGER.debug("Failed to set climat without hw power sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+
+        # set climat time left sensor
+        try:
+            self.vehicles[vehicle]['sensor_climat_time_left'] = int(data_emanager['EManager']['rpc']['status']['climatisationRemaningTime'])
+        except:
+            self.vehicles[vehicle]['sensor_climat_time_left'] = False
+            _LOGGER.debug("Failed to set climat time left sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
         # set electric range sensor
         try:
             self.vehicles[vehicle]['sensor_electric_range_left'] = int(data_emanager['EManager']['rbc']['status']['electricRange'])
         except:
-            _LOGGER.error("Failed to set target electric range sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+            self.vehicles[vehicle]['sensor_electric_range_left'] = False
+            _LOGGER.debug("Failed to set target electric range sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
         # set charging time left sensor
         try:
             charging_time_left = int(data_emanager['EManager']['rbc']['status']['chargingRemaningHour']) * 60 * 60
             charging_time_left += int(data_emanager['EManager']['rbc']['status']['chargingRemaningMinute']) * 60
-            self.vehicles[vehicle]['sensor_charging_time_left'] = charging_time_left
+            # only show chargint time left if vehicle is charging
+            if self.vehicles[vehicle]['state_charge']:
+                self.vehicles[vehicle]['sensor_charging_time_left'] = charging_time_left
+            else:
+                self.vehicles[vehicle]['sensor_charging_time_left'] = False
         except:
-            _LOGGER.error("Failed to set charging time sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+            self.vehicles[vehicle]['sensor_charging_time_left'] = False
+            _LOGGER.debug("Failed to set charging time sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
         # set next service inspection sensor
         try:
             self.vehicles[vehicle]['sensor_next_service_inspection'] = data_details['vehicleDetails']['serviceInspectionData']
         except:
-            _LOGGER.error("Failed to set next service inspection sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+            _LOGGER.debug("Failed to set next service inspection sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
         # set distance sensor
         try:
             self.vehicles[vehicle]['sensor_distance'] = int(data_details['vehicleDetails']['distanceCovered'].replace('.', ''))
         except:
-            _LOGGER.error("Failed to set distance sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+            _LOGGER.debug("Failed to set distance sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
         # set last connected sensor
         try:
             last_connected = data_details['vehicleDetails']['lastConnectionTimeStamp'][0] + ' ' + data_details['vehicleDetails']['lastConnectionTimeStamp'][1]
             datetime_object = datetime.strptime(last_connected, '%d.%m.%Y %H:%M')
-            self.vehicles[vehicle]['last_connected'] = datetime_object
+            self.vehicles[vehicle]['last_connected'] = datetime_object.strftime("%Y-%m-%d %H:%M:%S")
         except:
-            _LOGGER.error("Failed to set distance sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+            _LOGGER.debug("Failed to set distance sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+
+        # set door locked sensor
+        try:
+            vehicle_locked = True
+            lock_data = data_car['vehicleStatusData']['lockData']
+            for lock in lock_data:
+                if lock_data[lock] != 2:
+                    vehicle_locked = False
+
+            if vehicle_locked:
+                self.vehicles[vehicle]['sensor_door_locked'] = True
+            else:
+                self.vehicles[vehicle]['sensor_door_locked'] = False
+        except:
+            self.vehicles[vehicle]['sensor_door_locked'] = False
+            _LOGGER.debug("Failed to set door locked sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+
+        # set parking lights sensor
+        try:
+            if data_car['vehicleStatusData']['carRenderData']['parkingLights'] == 2:
+                self.vehicles[vehicle]['sensor_parking_lights'] = False
+            else:
+                self.vehicles[vehicle]['sensor_parking_lights'] = True
+        except:
+            self.vehicles[vehicle]['sensor_parking_lights'] = False
+            _LOGGER.debug("Failed to set parking lights sensor for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
         # set climate state
         try:
@@ -506,7 +561,7 @@ class VWCarnet(object):
             else:
                 self._set_state('climat', vehicle, True)
         except:
-            _LOGGER.error("Failed to set climat state for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+            _LOGGER.debug("Failed to set climat state for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
         # set window heating state
         try:
@@ -515,7 +570,7 @@ class VWCarnet(object):
             else:
                 self._set_state('melt', vehicle, True)
         except:
-            _LOGGER.error("Failed to set window heating state for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+            _LOGGER.debug("Failed to set window heating state for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
         # set charging state
         try:
@@ -524,10 +579,9 @@ class VWCarnet(object):
             else:
                 self._set_state('charge', vehicle, True)
         except:
-            _LOGGER.error("Failed to set charging state for vehicle %s" % (self.vehicles[vehicle].get('vin')))
+            _LOGGER.debug("Failed to set charging state for vehicle %s" % (self.vehicles[vehicle].get('vin')))
 
-        _LOGGER.debug("Status updated for vehicle %s" % (self.vehicles[vehicle].get('vin')))
-        _LOGGER.debug("Vehicle data: %s" % (self.vehicles[vehicle]))
+        _LOGGER.debug("New vehicle data: %s" % (self.vehicles[vehicle]))
         return True
 
 
@@ -544,18 +598,24 @@ class VWCarnet(object):
     def _switch_update_state(self, vehicle, switch, state = False):
         if switch == 'climat':
             if state:
+                _LOGGER.debug("Starting climatisation on vehicle %s" % (self.vehicles[vehicle].get('vin')))
                 self._carnet_start_climat(vehicle)
             else:
+                _LOGGER.debug("Stopping climatisation on vehicle %s" % (self.vehicles[vehicle].get('vin')))
                 self._carnet_stop_climat(vehicle)
         elif switch == 'charge':
             if state:
+                _LOGGER.debug("Starting charge on vehicle %s" % (self.vehicles[vehicle].get('vin')))
                 self._carnet_start_charge(vehicle)
             else:
+                _LOGGER.debug("Stopping charge on vehicle %s" % (self.vehicles[vehicle].get('vin')))
                 self._carnet_stop_charge(vehicle)
         elif switch == 'melt':
             if state:
+                _LOGGER.debug("Starting window heating on vehicle %s" % (self.vehicles[vehicle].get('vin')))
                 self._carnet_start_window_melt(vehicle)
             else:
+                _LOGGER.debug("Stopping window heating on vehicle %s" % (self.vehicles[vehicle].get('vin')))
                 self._carnet_stop_window_melt(vehicle)
 
     def _switch_get_state(self, vehicle, switch):
@@ -566,36 +626,104 @@ class VWCarnet(object):
         elif switch == 'melt':
             return self.vehicles[vehicle]['state_melt']
 
-    def _sensor_get_state(self, vehicle, sensor):
+
+class VolkswagenCarnetEntity(Entity):
+    """Representation of a Sensor."""
+
+    def __init__(self, hass, vehicle, sensor):
+        """Initialize the sensor."""
+        self.vw = hass.data[CARNET_DATA]
+        self.hass = hass
+        self.sensor = sensor
+        self.vehicle = vehicle
+
+    @property
+    def _attr(self):
+        return self.sensor.get('attr')
+
+    @property
+    def _get_vehicle_name(self):
+        return self.vehicle
+
+    @property
+    def _get_vehicle_data(self):
+        return self.vw.vehicles[self.vehicle]
+
+    @property
+    def _state(self):
         state = None
-        if sensor == 'battery':
-            state = self.vehicles[vehicle]['sensor_battery_left']
+        if self._sensor_name == 'battery':
+            state = self._get_vehicle_data['sensor_battery_left']
 
-        elif sensor == 'charge_max_ampere':
-            state = self.vehicles[vehicle]['sensor_charge_max_ampere']
+        elif self._sensor_name == 'charge_max_ampere':
+            state = self._get_vehicle_data['sensor_charge_max_ampere']
 
-        elif sensor == 'external_power_connected':
-            state = self.vehicles[vehicle]['sensor_external_power_connected']
+        elif self._sensor_name == 'charging_time_left':
+            # return minutes left instead of seconds
+            state = int(round(self._get_vehicle_data['sensor_charging_time_left'] / 60))
 
-        elif sensor == 'charging_time_left':
-            state = self.vehicles[vehicle]['sensor_charging_time_left']
+        elif self._sensor_name == 'climat_target_temperature':
+            state = self._get_vehicle_data['sensor_climat_target_temperature']
 
-        elif sensor == 'climat_target_temperature':
-            state = self.vehicles[vehicle]['sensor_climat_target_temperature']
+        elif self._sensor_name == 'electric_range_left':
+            state = self._get_vehicle_data['sensor_electric_range_left']
 
-        elif sensor == 'electric_range_left':
-            state = self.vehicles[vehicle]['sensor_electric_range_left']
+        elif self._sensor_name == 'distance':
+            state = self._get_vehicle_data['sensor_distance']
 
-        elif sensor == 'distance':
-            state = self.vehicles[vehicle]['sensor_distance']
+        elif self._sensor_name == 'last_connected':
+            state = self._get_vehicle_data['last_connected']
 
-        elif sensor == 'last_update':
-            datetime_object = self.vehicles[vehicle]['last_connected']
-            if datetime_object:
-                state = datetime_object.strftime("%Y-%m-%d %H:%M:%S")
+        elif self._sensor_name == 'next_service_inspection':
+            state = self._get_vehicle_data['sensor_next_service_inspection']
 
         if state:
             return state
         else:
             return None
+
+    @property
+    def _sensor_name(self):
+        return self.sensor.get('name')
+
+    @property
+    def _last_updated(self):
+        """Return the last update of a device."""
+        last_updated = self.vw.vehicles[self.vehicle].get('last_updated')
+        if last_updated:
+            return last_updated
+        else:
+            return None
+
+    @property
+    def name(self):
+        """Return the name of the sensor."""
+        return 'vw_%s_%s' % (self.vehicle, self._sensor_name)
+
+    @property
+    def icon(self):
+        """Return the icon."""
+        if self._sensor_name == 'battery':
+            return icon_for_battery_level(battery_level=int(self._state), charging = self._get_vehicle_data['state_charge'])
+        else:
+            return self.sensor.get('icon')
+
+    @property
+    def hidden(self):
+        """Return True if the entity should be hidden from UIs."""
+        return self.sensor.get('hidden')
+
+    @property
+    def device_state_attributes(self):
+        """Return the state attributes."""
+        attrs = {}
+        if self._last_updated:
+            attrs['time_last_updated'] = self._last_updated
+        # add extra attributes
+        attrs.update(self._attr)
+        if self._sensor_name == 'battery' and self._get_vehicle_data['sensor_battery_left']:
+            attrs['battery_level'] = self._get_vehicle_data['sensor_battery_left']
+            attrs['battery_icon'] = 'mdi:battery'
+        return attrs
+
 

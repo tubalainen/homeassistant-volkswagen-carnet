@@ -2,7 +2,7 @@ Volkswagen Carnet - An home assistant plugin to add integration with your car
 ============================================================
 Information
 ------------
-This plugin is still in developing state. And multiple vehicle support hasn't yet been added.
+This plugin is still in developing state.
 
 Installation
 ------------
@@ -13,11 +13,17 @@ Clone or copy the root of the repository into `<config dir>/custom_components`
 
 Add a volkswagen_carnet configuration block to your `<config dir>/configuration.yaml`
 
+Start the Home Assistant service with the configuration below, check "states" in Home Assistant to find out your CarNet ID, replace vw_carid with your ID throughout the example configuration below, save the config files and restart Home Assistant.
+
+```switch.vw_carid_charge ---> switch.vw_wvwzzzXczheXXXXXXX_charge```
+
+
 ```yaml
 volkswagen_carnet:
     username: <username to volkswagen carnet>
     password: <password to volkswagen carnet>
-
+    update_interval: 
+        minutes: 3 # specify in minutes how often to fetch status data from carnet (optional, default 3 min, minimum 2 min)
 ```
 
 Group example
@@ -31,6 +37,7 @@ volkswagendashboard:
     entities:
         - group.volkswagenswitches
         - group.volkswagensensors
+        - group.volkswagenlocation
 
 volkswagenswitches:
     name: Volkswagen Switches
@@ -39,10 +46,9 @@ volkswagenswitches:
         - switch.vw_carid_charge
         - switch.vw_carid_climat
         - switch.vw_carid_melt
-        - device_tracker.vw_carid
   
 volkswagensensors:
-    name: Volkswagen Sensors
+    name: Volkswagen Information
     control: hidden
     entities:
         - sensor.vw_carid_battery
@@ -51,7 +57,17 @@ volkswagensensors:
         - sensor.vw_carid_climat_target_temperature
         - sensor.vw_carid_distance
         - sensor.vw_carid_electric_range_left
-        - sensor.vw_carid_external_power_connected
+        - sensor.vw_carid_last_connected
+        - sensor.vw_carid_next_service_inspection
+        - binary_sensor.vw_carid_door_locked
+        - binary_sensor.vw_carid_parking_lights
+        - binary_sensor.vw_carid_external_power_connected
+        
+volkswagenlocation:
+    name: Volkswagen Location
+    control: hidden
+    entities:
+        - device_tracker.vw_carid
 ```
 
 Customize example
@@ -78,6 +94,26 @@ sensor.vw_carid_distance:
     friendly_name: VW Car Odometer
 sensor.vw_carid_electric_range_left:
     friendly_name: VW Car Electric Range Left
-sensor.vw_carid_external_power_connected:
+sensor.vw_carid_last_connected:
+    friendly_name: VW Car Last Connected
+sensor.vw_carid_next_service_inspection:
+    friendly_name: VW Car Next Service
+binary_sensor.vw_carid_door_locked:
+    friendly_name: VW Car Doors
+binary_sensor.vw_carid_parking_lights:
+    friendly_name: VW Car Parking Lights
+binary_sensor.vw_carid_external_power_connected:
     friendly_name: VW Car External Power Connected
 ```
+
+Enable debug logging
+------------
+```yaml
+logger:
+    default: info
+    logs:
+        custom_components.volkswagen_carnet: debug
+        custom_components.sensor.volkswagen_carnet: debug
+        custom_components.switch.volkswagen_carnet: debug
+        custom_components.device_tracker.volkswagen_carnet: debug
+ ```
